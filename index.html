@@ -1242,12 +1242,20 @@ const ResourcePack = {
     const zip = await JSZip.loadAsync(file);
     const wanted = new Set(Atlas.names);
     const found = new Map();
+    let chestEntry = null;
     const re = /(^|\/)assets\/minecraft\/textures\/(block|blocks|item|items)\/([a-z0-9_\-]+)\.png$/;
     zip.forEach((path, entry) => {
       if (entry.dir) return;
       const lower = path.toLowerCase();
       // Ignore OptiFine / MCPatcher extensions (CTM, CIT, emissive, random mobs) and metadata files.
       if (lower.includes('optifine/') || lower.includes('mcpatcher/') || lower.includes('/ctm/') || lower.endsWith('.mcmeta') || lower.endsWith('.properties')) return;
+      // Chests are special-rendered block entities in Java packs, so their art
+      // lives on a 64x64 entity sheet instead of three block-face textures.
+      if (/(^|\/)assets\/minecraft\/textures\/entity\/chest\/normal\.png$/.test(lower)) {
+        const prio = lower.startsWith('assets/') ? 4 : 0;
+        if (!chestEntry || chestEntry.prio < prio) chestEntry = { entry, prio };
+        return;
+      }
       const m = lower.match(re); if (!m) return;
       let name = m[3];
       if (TEX_ALIASES[name]) name = TEX_ALIASES[name];
@@ -1265,6 +1273,12 @@ const ResourcePack = {
       try { const blob = await entry.async('blob'); images.set(name, await blobToImage(blob)); }
       catch (e) { console.warn('Resource pack: could not decode ' + name, e); }
     }));
+    if (chestEntry && ['chest_top', 'chest_side', 'chest_front'].some(name => wanted.has(name) && !images.has(name))) {
+      try {
+        const sheet = await blobToImage(await chestEntry.entry.async('blob'));
+        for (const [name, tile] of chestTilesFromEntity(sheet)) if (wanted.has(name) && !images.has(name)) images.set(name, tile);
+      } catch (e) { console.warn('Resource pack: could not decode the chest entity sheet', e); }
+    }
     Atlas.packImages = images;
     Atlas.build();
     this.loaded = true; this.name = file.name; this.count = images.size; this.total = wanted.size;
@@ -1275,6 +1289,30 @@ const ResourcePack = {
 function blobToImage(blob) {
   if (window.createImageBitmap) return createImageBitmap(blob, { premultiplyAlpha: 'none', colorSpaceConversion: 'none' }).catch(() => createImageBitmap(blob));
   return new Promise((res, rej) => { const url = URL.createObjectURL(blob); const img = new Image(); img.onload = () => { URL.revokeObjectURL(url); res(img); }; img.onerror = rej; img.src = url; });
+}
+
+// Convert Java's standard chest entity UV sheet into the three square tiles
+// used by Voxelcraft's lightweight cube model. The crop scales with 16x/32x/
+// 64x packs and keeps nearest-neighbour pixel art intact.
+function chestTilesFromEntity(sheet) {
+  if (sheet.width !== sheet.height || sheet.width < 64 || sheet.width % 64 !== 0) throw new Error('unsupported chest texture dimensions');
+  const s = sheet.width / 64, size = 16 * s;
+  const canvas = () => { const cv = document.createElement('canvas'); cv.width = cv.height = size; return cv; };
+  const draw = (ctx, sx, sy, sw, sh, dx, dy, dw, dh) => ctx.drawImage(sheet, sx * s, sy * s, sw * s, sh * s, dx * s, dy * s, dw * s, dh * s);
+
+  const top = canvas(), topCtx = top.getContext('2d'); topCtx.imageSmoothingEnabled = false;
+  draw(topCtx, 14, 0, 14, 14, 0, 0, 16, 16);
+
+  const side = canvas(), sideCtx = side.getContext('2d'); sideCtx.imageSmoothingEnabled = false;
+  draw(sideCtx, 0, 14, 14, 5, 0, 0, 16, 6);
+  draw(sideCtx, 0, 33, 14, 10, 0, 6, 16, 10);
+
+  const front = canvas(), frontCtx = front.getContext('2d'); frontCtx.imageSmoothingEnabled = false;
+  draw(frontCtx, 14, 14, 14, 5, 0, 0, 16, 6);
+  draw(frontCtx, 14, 33, 14, 10, 0, 6, 16, 10);
+  draw(frontCtx, 1, 1, 2, 4, 7, 4, 2, 4);
+
+  return new Map([['chest_top', top], ['chest_side', side], ['chest_front', front]]);
 }
 /* ============================================================================
    6. WORLD STORAGE — chunks, tile entities, the block-change pipeline

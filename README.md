@@ -8,6 +8,7 @@ Built with [Three.js](https://threejs.org/) (r128) and [JSZip](https://stuk.gith
 
 ## Run it
 
+- **From this workspace:** double-click the top-level `Play AI Minecraft Clones.cmd` launcher and open the Voxelcraft card. The launcher serves the game over HTTP, so the installed `resourcepack.zip` loads automatically.
 - **Simplest:** double-click `index.html`. Chrome, Edge and Firefox all work.
 - **With a resource pack that loads automatically:** serve the folder over HTTP and drop a pack next to the page as `resourcepack.zip`:
 
@@ -17,6 +18,8 @@ Built with [Three.js](https://threejs.org/) (r128) and [JSZip](https://stuk.gith
   ```
 
   Packs can also be dragged onto the title screen or loaded from the pause menu at any time, including when the file is opened directly from disk.
+
+Opening `index.html` directly uses the procedural fallback until you choose or drop the ZIP; browsers do not allow a `file://` page to fetch a sibling pack automatically.
 
 ## Features
 
@@ -41,7 +44,12 @@ Built with [Three.js](https://threejs.org/) (r128) and [JSZip](https://stuk.gith
 
 **Resource packs**
 - Loads standard Minecraft Java resource packs (`.zip`). Block and item textures are matched by vanilla file name; 16x, 32x and 64x packs are handled; animated textures use their first frame; OptiFine/MCPatcher assets and `.mcmeta` files are ignored; legacy (1.12) names are aliased.
+- Handles Java's special chest entity sheet by deriving the three square chest faces used by Voxelcraft.
 - Anything a pack does not provide falls back to procedurally generated 16x16 pixel art, so the game is fully playable with zero external files.
+
+## Item coverage report
+
+The Java 26.2 comparison is in [`reports/item-texture-audit.md`](reports/item-texture-audit.md). The complete machine-readable list of Java items not implemented in Voxelcraft is [`reports/items-not-in-game.csv`](reports/items-not-in-game.csv).
 
 ## Controls
 
@@ -86,7 +94,8 @@ Unfinished or simplified features are marked in the code with `// STUB:`; the fu
 
 ## Third-party content
 
-- Resource packs are **not** included. Most packs, including [New Default+](https://modrinth.com/resourcepack/new-default-plus), carry their own licenses; download them yourself and place the zip next to `index.html` as `resourcepack.zip` (it is git-ignored).
+- Resource packs are **not committed**. This workspace has a local, git-ignored `resourcepack.zip` copied from the supplied official Java 26.2 reference bundle. Mojang/Microsoft owns that art; keep it local unless your intended distribution complies with the applicable EULA and usage guidelines.
+- Other packs, including [New Default+](https://modrinth.com/resourcepack/new-default-plus), carry their own licenses; download them yourself and place the ZIP next to `index.html` as `resourcepack.zip`.
 - Voxelcraft is an independent project. "Minecraft" is a trademark of Mojang Studios / Microsoft; this project is not affiliated with or endorsed by them.
 
 ## License
