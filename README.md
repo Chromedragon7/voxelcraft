@@ -43,7 +43,7 @@ Opening `index.html` directly uses the procedural fallback until you choose or d
 - Autosave to localStorage (deflated), plus JSON export and import. Worlds are reproducible from their seed.
 
 **Resource packs**
-- Loads standard Minecraft Java resource packs (`.zip`). Block and item textures are matched by vanilla file name; 16x, 32x and 64x packs are handled; animated textures use their first frame; OptiFine/MCPatcher assets and `.mcmeta` files are ignored; legacy (1.12) names are aliased.
+- Loads compatible Java resource packs (`.zip`). Block and item textures are matched by file name, and the seven implemented mob types use their corresponding entity sheets; 16x, 32x and 64x packs are handled; animated textures use their first frame; OptiFine/MCPatcher assets and `.mcmeta` files are ignored; legacy (1.12) names are aliased.
 - Handles Java's special chest entity sheet by deriving the three square chest faces used by Voxelcraft.
 - Anything a pack does not provide falls back to procedurally generated 16x16 pixel art, so the game is fully playable with zero external files.
 
@@ -70,6 +70,8 @@ Right-click crafting tables, furnaces, chests, doors and levers to use them. Fli
 
 `index.html` is organised as numbered systems, each under a `====` banner, so it can be read top to bottom:
 
+For a focused, LLM-ready description of the controller, collision, camera, targeting, mining, combat, survival, and timing behavior, see [`docs/PLAYER_MECHANICS_RECONSTRUCTION.md`](docs/PLAYER_MECHANICS_RECONSTRUCTION.md).
+
 1. Utilities (constants, seeded PRNG, simplex noise)
 2. Block and item registries
 3. Recipes
@@ -90,7 +92,7 @@ Right-click crafting tables, furnaces, chests, doors and levers to use them. Fli
 18. HUD, persistence, menus
 19. Bootstrap and main loop
 
-Unfinished or simplified features are marked in the code with `// STUB:`; the full list is at the bottom of the script. Highlights of what is not there yet: the Nether and the End, villages and mineshafts, villager trading, enchanting and brewing, redstone repeaters and pistons, mob textures from resource packs, audio.
+Unfinished or simplified features are marked in the code with `// STUB:`; the full list is at the bottom of the script. Highlights of what is not there yet: the Nether and the End, villages and mineshafts, villager trading, enchanting and brewing, redstone repeaters and pistons, audio.
 
 ## Third-party content
 

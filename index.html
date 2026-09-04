@@ -1246,12 +1246,31 @@ for (const c of WOOL_NAMES) TEX_ALIASES['wool_colored_' + c.replace('light_', 's
 for (const k of ['pickaxe', 'axe', 'shovel', 'hoe', 'sword']) { TEX_ALIASES['wood_' + k] = 'wooden_' + k; TEX_ALIASES['gold_' + k] = 'golden_' + k; }
 for (let i = 0; i < 8; i++) TEX_ALIASES['wheat_stage_' + i] = 'wheat_stage' + i;
 
+// Entity sheets used by the seven mobs implemented below. The temperate files
+// are the supplied pack's default pig/cow/chicken skins; legacy names keep
+// older compatible packs working too.
+const MOB_TEXTURE_FILES = Object.freeze({
+  pig: ['entity/pig/pig_temperate.png', 'entity/pig/pig.png', 'entity/pig.png'],
+  cow: ['entity/cow/cow_temperate.png', 'entity/cow/cow.png', 'entity/cow.png'],
+  sheep: ['entity/sheep/sheep.png', 'entity/sheep.png'],
+  sheep_wool: ['entity/sheep/sheep_wool.png', 'entity/sheep/sheep_fur.png'],
+  chicken: ['entity/chicken/chicken_temperate.png', 'entity/chicken/chicken.png', 'entity/chicken.png'],
+  zombie: ['entity/zombie/zombie.png', 'entity/zombie.png'],
+  skeleton: ['entity/skeleton/skeleton.png', 'entity/skeleton.png'],
+  creeper: ['entity/creeper/creeper.png', 'entity/creeper.png']
+});
+const MOB_TEXTURE_KEYS = Object.freeze(['pig', 'cow', 'sheep', 'chicken', 'zombie', 'skeleton', 'creeper']);
+const MOB_TEXTURE_LOOKUP = new Map();
+for (const [key, paths] of Object.entries(MOB_TEXTURE_FILES)) paths.forEach((path, i) => MOB_TEXTURE_LOOKUP.set(path, { key, rank: paths.length - i }));
+
 const ResourcePack = {
-  loaded: false, name: '', count: 0, total: 0,
+  loaded: false, name: '', count: 0, total: 0, mobCount: 0, mobTotal: MOB_TEXTURE_KEYS.length, _revision: 0,
   async load(file) {
+    const revision = ++this._revision;
     const zip = await JSZip.loadAsync(file);
+    if (revision !== this._revision) return null;
     const wanted = new Set(Atlas.names);
-    const found = new Map();
+    const found = new Map(), mobFound = new Map();
     let chestEntry = null;
     const re = /(^|\/)assets\/minecraft\/textures\/(block|blocks|item|items)\/([a-z0-9_\-]+)\.png$/;
     zip.forEach((path, entry) => {
@@ -1265,6 +1284,17 @@ const ResourcePack = {
         const prio = lower.startsWith('assets/') ? 4 : 0;
         if (!chestEntry || chestEntry.prio < prio) chestEntry = { entry, prio };
         return;
+      }
+      const marker = 'assets/minecraft/textures/';
+      const assetAt = lower.lastIndexOf(marker);
+      if (assetAt >= 0) {
+        const spec = MOB_TEXTURE_LOOKUP.get(lower.slice(assetAt + marker.length));
+        if (spec) {
+          const prio = (assetAt === 0 ? 100 : 0) + spec.rank;
+          const prev = mobFound.get(spec.key);
+          if (!prev || prev.prio < prio) mobFound.set(spec.key, { entry, prio });
+          return;
+        }
       }
       const m = lower.match(re); if (!m) return;
       let name = m[3];
@@ -1283,22 +1313,47 @@ const ResourcePack = {
       try { const blob = await entry.async('blob'); images.set(name, await blobToImage(blob)); }
       catch (e) { console.warn('Resource pack: could not decode ' + name, e); }
     }));
+    const mobImages = new Map();
+    await Promise.all([...mobFound].map(async ([name, { entry }]) => {
+      try {
+        const image = imageToCanvas(await blobToImage(await entry.async('blob'))), scale = image.width / 64;
+        if (!Number.isInteger(scale) || scale < 1 || (image.height !== 32 * scale && image.height !== 64 * scale)) throw new Error(`unsupported ${image.width}x${image.height} sheet`);
+        mobImages.set(name, image);
+      }
+      catch (e) { console.warn('Resource pack: could not decode mob texture ' + name, e); }
+    }));
     if (chestEntry && ['chest_top', 'chest_side', 'chest_front'].some(name => wanted.has(name) && !images.has(name))) {
       try {
         const sheet = await blobToImage(await chestEntry.entry.async('blob'));
-        for (const [name, tile] of chestTilesFromEntity(sheet)) if (wanted.has(name) && !images.has(name)) images.set(name, tile);
+        try { for (const [name, tile] of chestTilesFromEntity(sheet)) if (wanted.has(name) && !images.has(name)) images.set(name, tile); }
+        finally { if (typeof sheet.close === 'function') sheet.close(); }
       } catch (e) { console.warn('Resource pack: could not decode the chest entity sheet', e); }
     }
+    if (revision !== this._revision) {
+      closeDecodedImages(images);
+      return null;
+    }
+    const oldAtlasImages = Atlas.packImages;
     Atlas.packImages = images;
     Atlas.build();
-    this.loaded = true; this.name = file.name; this.count = images.size; this.total = wanted.size;
-    return { count: images.size, total: wanted.size };
+    closeDecodedImages(oldAtlasImages);
+    Mobs.replaceEntityImages(mobImages);
+    const mobCount = MOB_TEXTURE_KEYS.filter(name => mobImages.has(name) && (name !== 'sheep' || mobImages.has('sheep_wool'))).length;
+    this.loaded = true; this.name = file.name; this.count = images.size; this.total = wanted.size; this.mobCount = mobCount;
+    return { count: images.size, total: wanted.size, mobCount, mobTotal: this.mobTotal };
   },
-  unload() { Atlas.packImages = new Map(); Atlas.build(); this.loaded = false; this.name = ''; this.count = 0; }
+  unload() { this._revision++; const oldAtlasImages = Atlas.packImages; Atlas.packImages = new Map(); Atlas.build(); closeDecodedImages(oldAtlasImages); Mobs.replaceEntityImages(new Map()); this.loaded = false; this.name = ''; this.count = 0; this.mobCount = 0; }
 };
+function closeDecodedImages(images) { for (const image of images.values()) if (typeof image.close === 'function') image.close(); }
 function blobToImage(blob) {
   if (window.createImageBitmap) return createImageBitmap(blob, { premultiplyAlpha: 'none', colorSpaceConversion: 'none' }).catch(() => createImageBitmap(blob));
-  return new Promise((res, rej) => { const url = URL.createObjectURL(blob); const img = new Image(); img.onload = () => { URL.revokeObjectURL(url); res(img); }; img.onerror = rej; img.src = url; });
+  return new Promise((res, rej) => { const url = URL.createObjectURL(blob); const img = new Image(); img.onload = () => { URL.revokeObjectURL(url); res(img); }; img.onerror = (e) => { URL.revokeObjectURL(url); rej(e); }; img.src = url; });
+}
+function imageToCanvas(image) {
+  const cv = document.createElement('canvas'); cv.width = image.width; cv.height = image.height;
+  try { const ctx = cv.getContext('2d'); ctx.imageSmoothingEnabled = false; ctx.drawImage(image, 0, 0); }
+  finally { if (typeof image.close === 'function') image.close(); }
+  return cv;
 }
 
 // Convert Java's standard chest entity UV sheet into the three square tiles
@@ -3645,11 +3700,10 @@ const Entities = {
 };
 const TICK_FLUID = 0, TICK_FALL = 1, TICK_REDSTONE = 2, TICK_FIRE = 3;
 /* ============================================================================
-   15. MOBS — box models, AI, spawning, combat, drops
+   15. MOBS — textured box models, AI, spawning, combat, drops
    ----------------------------------------------------------------------------
-   Models are built from coloured boxes (procedural, like the block fallback).
-   STUB: entity textures from resource packs (entity/pig/pig.png ...) are not
-   mapped onto the box UV layout yet — mobs always use procedural colours.
+   Models use entity sheets from the active resource pack, with the original
+   procedural colours retained as a per-part fallback.
    ========================================================================== */
 const MOB_TYPES = {
   pig:      { w: 0.45, h: 0.9,  health: 10, speed: 1.6, passive: true,  drops: [['porkchop', 1, 3]], name: 'Pig' },
@@ -3663,7 +3717,7 @@ const MOB_TYPES = {
 const SHEEP_COLOR_WEIGHTS = [['white', 81], ['black', 5], ['gray', 5], ['light_gray', 5], ['brown', 3], ['pink', 1]];
 
 const Mobs = {
-  list: [], scene: null, faceTex: new Map(), needsCompact: false,
+  list: [], scene: null, faceTex: new Map(), entityImages: new Map(), entityTex: new Map(), needsCompact: false,
   init(scene) { this.scene = scene; },
   disposeModel(m) {
     if (!m || !m.mesh) return;
@@ -3675,7 +3729,7 @@ const Mobs = {
     });
     for (const geo of geometries) geo.dispose();
     for (const mat of materials) mat.dispose();
-    // Face maps are shared in faceTex; only the per-mob health texture is owned here.
+    // Face/entity maps are shared caches; only the per-mob health texture is owned here.
     if (m.parts && m.parts.hp && m.parts.hp.material.map) m.parts.hp.material.map.dispose();
     m.mesh = null; m.parts = null;
   },
@@ -3684,6 +3738,43 @@ const Mobs = {
     let write = 0;
     for (let read = 0; read < this.list.length; read++) if (!this.list[read].removed) this.list[write++] = this.list[read];
     this.list.length = write; this.needsCompact = false;
+  },
+
+  replaceEntityImages(images) {
+    const oldTextures = this.entityTex;
+    this.entityImages = images || new Map(); this.entityTex = new Map();
+    if (this.scene) for (const m of this.list) if (!m.removed) this.rebuild(m);
+    for (const tex of oldTextures.values()) tex.dispose();
+  },
+  entityTexture(name) {
+    if (this.entityTex.has(name)) return this.entityTex.get(name);
+    const image = this.entityImages.get(name); if (!image) return null;
+    const tex = new THREE.CanvasTexture(image);
+    tex.flipY = false; tex.magFilter = tex.minFilter = THREE.NearestFilter; tex.generateMipmaps = false;
+    tex.wrapS = tex.wrapT = THREE.ClampToEdgeWrapping; tex.needsUpdate = true;
+    this.entityTex.set(name, tex);
+    return tex;
+  },
+  applyBoxUV(geo, texture, spec, mirror) {
+    const [u, v, w, h, d] = spec, sheetW = texture.image.width, sheetH = texture.image.height, scale = sheetW / 64;
+    const rects = [
+      [u + d + w, v + d, d, h], [u, v + d, d, h],
+      [u + d, v, w, d], [u + d + w, v, w, d],
+      [u + 2 * d + w, v + d, w, h], [u + d, v + d, w, h]
+    ];
+    if (mirror) [rects[0], rects[1]] = [rects[1], rects[0]];
+    const uv = geo.getAttribute('uv'), inset = 0.001;
+    if (!uv || uv.count !== 24) throw new Error('Mob skin UVs require an unsegmented BoxGeometry');
+    rects.forEach(([x, y, rw, rh], faceIndex) => {
+      let left = (x + inset) * scale / sheetW, right = (x + rw - inset) * scale / sheetW;
+      const top = (y + inset) * scale / sheetH, bottom = (y + rh - inset) * scale / sheetH;
+      if (mirror) [left, right] = [right, left];
+      const coords = faceIndex === 2 ? [left, bottom, right, bottom, left, top, right, top]
+        : faceIndex === 3 ? [left, top, right, top, left, bottom, right, bottom]
+        : [right, top, left, top, right, bottom, left, bottom];
+      for (let i = 0; i < 4; i++) uv.setXY(faceIndex * 4 + i, coords[i * 2], coords[i * 2 + 1]);
+    });
+    uv.needsUpdate = true;
   },
 
   // ---- Model construction ----
@@ -3708,45 +3799,78 @@ const Mobs = {
   box(parent, w, h, d, x, y, z, color, opts = {}) {
     // sizes/positions in 1/16 block units; (x,y,z) is the box centre unless opts.pivotTop (then it is the top-centre)
     const geo = new THREE.BoxGeometry(w / 16, h / 16, d / 16);
+    const skin = opts.skin && opts.uv ? this.entityTexture(opts.skin) : null;
     let mat;
-    if (opts.face) { const m = new THREE.MeshLambertMaterial({ color }); mat = [m, m, m, m, m, new THREE.MeshLambertMaterial({ map: opts.face })]; }
+    if (skin) {
+      this.applyBoxUV(geo, skin, opts.uv, !!opts.mirror);
+      mat = new THREE.MeshLambertMaterial({ color: opts.tint || '#ffffff', map: skin, alphaTest: 0.1 });
+    }
+    else if (opts.face) { const m = new THREE.MeshLambertMaterial({ color }); mat = [m, m, m, m, m, new THREE.MeshLambertMaterial({ map: opts.face })]; }
     else mat = new THREE.MeshLambertMaterial({ color });
     const mesh = new THREE.Mesh(geo, mat);
+    if (opts.rotateX) mesh.rotation.x = opts.rotateX;
     const pivot = new THREE.Group();
     pivot.position.set(x / 16, y / 16, z / 16);
     if (opts.pivotTop) mesh.position.y = -h / 32; else if (opts.pivotBottom) mesh.position.y = h / 32;
     pivot.add(mesh); parent.add(pivot);
-    pivot.userData.mesh = mesh;
+    pivot.userData.mesh = mesh; pivot.userData.skin = skin ? opts.skin : '';
     return pivot;
   },
   buildModel(m) {
     const g = new THREE.Group(), t = m.type, parts = { legs: [], arms: [] };
     const face = (base) => this.faceTexture(t, base);
-    if (t === 'pig' || t === 'cow' || t === 'sheep') {
-      const legH = t === 'pig' ? 6 : 12, body = t === 'pig' ? '#f0a5a5' : t === 'cow' ? '#4a2f1f' : (m.sheared ? '#e2c8b8' : WOOL_COLORS[m.color]);
-      const skin = t === 'pig' ? '#f0a5a5' : t === 'cow' ? '#4a2f1f' : '#c8b8a8';
-      parts.body = this.box(g, 10, 8, 16, 0, legH + 4, 0, body);
-      parts.head = this.box(g, 8, 8, 8, 0, legH + 6, -10, t === 'sheep' ? WOOL_COLORS[m.color] : skin, { face: face(skin) });
-      for (const [lx, lz] of [[-3, -5], [3, -5], [-3, 5], [3, 5]]) parts.legs.push(this.box(g, 4, legH, 4, lx, legH, lz, skin, { pivotTop: true }));
-      if (t === 'cow') { this.box(g, 1, 3, 1, -4, legH + 10, -10, '#e8e8e8'); this.box(g, 1, 3, 1, 4, legH + 10, -10, '#e8e8e8'); }
+    const skinOpts = (name, uv, extra = {}) => ({ skin: name, uv, ...extra });
+    if (t === 'pig') {
+      const skin = '#f0a5a5';
+      parts.body = this.box(g, 10, 16, 8, 0, 10, 0, skin, skinOpts('pig', [28, 8, 10, 16, 8], { rotateX: -Math.PI / 2 }));
+      parts.head = this.box(g, 8, 8, 8, 0, 12, -10, skin, skinOpts('pig', [0, 0, 8, 8, 8], { face: face(skin) }));
+      parts.snout = this.box(g, 4, 3, 1, 0, 10.5, -14.5, '#e08a8a', skinOpts('pig', [16, 16, 4, 3, 1]));
+      for (const [i, [lx, lz]] of [[-3, -5], [3, -5], [-3, 5], [3, 5]].entries()) parts.legs.push(this.box(g, 4, 6, 4, lx, 6, lz, skin, skinOpts('pig', [0, 16, 4, 6, 4], { pivotTop: true, mirror: i % 2 === 1 })));
+    } else if (t === 'cow') {
+      const skin = '#4a2f1f';
+      parts.body = this.box(g, 12, 18, 10, 0, 17, 0, skin, skinOpts('cow', [18, 4, 12, 18, 10], { rotateX: -Math.PI / 2 }));
+      parts.head = this.box(g, 8, 8, 6, 0, 18, -12, skin, skinOpts('cow', [0, 0, 8, 8, 6], { face: face(skin) }));
+      parts.muzzle = this.box(g, 6, 3, 1, 0, 15.5, -15.5, '#c8b8a8', skinOpts('cow', [1, 33, 6, 3, 1]));
+      parts.udder = this.box(g, 4, 6, 1, 0, 11.5, 6, '#e8a0a0', skinOpts('cow', [52, 0, 4, 6, 1], { rotateX: -Math.PI / 2 }));
+      for (const [i, [lx, lz]] of [[-4, -6], [4, -6], [-4, 6], [4, 6]].entries()) parts.legs.push(this.box(g, 4, 12, 4, lx, 12, lz, skin, skinOpts('cow', [0, 16, 4, 12, 4], { pivotTop: true, mirror: i % 2 === 1 })));
+      parts.horns = [
+        this.box(g, 1, 3, 1, -4, 22, -12, '#e8e8e8', skinOpts('cow', [22, 0, 1, 3, 1], { pivotBottom: true })),
+        this.box(g, 1, 3, 1, 4, 22, -12, '#e8e8e8', skinOpts('cow', [22, 0, 1, 3, 1], { pivotBottom: true }))
+      ];
+    } else if (t === 'sheep') {
+      const skin = '#c8b8a8', wool = WOOL_COLORS[m.color];
+      parts.body = this.box(g, 8, 16, 6, 0, 15, 0, skin, skinOpts('sheep', [28, 8, 8, 16, 6], { rotateX: -Math.PI / 2 }));
+      parts.head = this.box(g, 6, 6, 8, 0, 18, -10, skin, skinOpts('sheep', [0, 0, 6, 6, 8], { face: face(skin) }));
+      for (const [i, [lx, lz]] of [[-2.5, -5], [2.5, -5], [-2.5, 5], [2.5, 5]].entries()) parts.legs.push(this.box(g, 4, 12, 4, lx, 12, lz, skin, skinOpts('sheep', [0, 16, 4, 12, 4], { pivotTop: true, mirror: i % 2 === 0 })));
+      if (!m.sheared) {
+        parts.wool = [
+          this.box(g, 11.5, 19.5, 9.5, 0, 15, 0, wool, skinOpts('sheep_wool', [28, 8, 8, 16, 6], { rotateX: -Math.PI / 2, tint: wool })),
+          this.box(g, 7.2, 7.2, 7.2, 0, 18, -9, wool, skinOpts('sheep_wool', [0, 0, 6, 6, 6], { face: face(wool), tint: wool }))
+        ];
+        // Parent upper-leg fleece to the base leg pivot so both layers swing together.
+        for (let i = 0; i < parts.legs.length; i++) parts.wool.push(this.box(parts.legs[i], 5, 7, 5, 0, 0.5, 0, wool, skinOpts('sheep_wool', [0, 16, 4, 6, 4], { pivotTop: true, tint: wool })));
+      }
     } else if (t === 'chicken') {
-      parts.body = this.box(g, 6, 6, 8, 0, 8, 0, '#f4f4f4');
-      parts.head = this.box(g, 4, 6, 3, 0, 13, -4, '#f4f4f4', { face: face('#f4f4f4') });
-      for (const lx of [-1.5, 1.5]) parts.legs.push(this.box(g, 1, 5, 1, lx, 5, 0, '#f0c020', { pivotTop: true }));
-      for (const lx of [-3.5, 3.5]) parts.arms.push(this.box(g, 1, 4, 6, lx, 10, 0, '#e8e8e8', { pivotTop: true }));
+      const skin = '#f4f4f4';
+      parts.body = this.box(g, 6, 8, 6, 0, 8, 0, skin, skinOpts('chicken', [0, 9, 6, 8, 6], { rotateX: -Math.PI / 2 }));
+      parts.head = this.box(g, 4, 6, 3, 0, 13, -4, skin, skinOpts('chicken', [0, 0, 4, 6, 3], { face: face(skin) }));
+      parts.beak = this.box(g, 4, 2, 2, 0, 13, -6.5, '#f0c020', skinOpts('chicken', [14, 0, 4, 2, 2]));
+      parts.wattle = this.box(g, 2, 2, 2, 0, 11, -6, '#d02020', skinOpts('chicken', [14, 4, 2, 2, 2]));
+      for (const lx of [-2, 2]) parts.legs.push(this.box(g, 3, 5, 3, lx, 5, 0, '#f0c020', skinOpts('chicken', [26, 0, 3, 5, 3], { pivotTop: true })));
+      for (const lx of [-3.5, 3.5]) parts.arms.push(this.box(g, 1, 4, 6, lx, 10, 0, '#e8e8e8', skinOpts('chicken', [24, 13, 1, 4, 6], { pivotTop: true })));
     } else if (t === 'creeper') {
-      parts.body = this.box(g, 8, 12, 4, 0, 12, 0, '#4aa64a');
-      parts.head = this.box(g, 8, 8, 8, 0, 22, 0, '#4aa64a', { face: face('#4aa64a') });
-      for (const [lx, lz] of [[-2, -2], [2, -2], [-2, 2], [2, 2]]) parts.legs.push(this.box(g, 4, 6, 4, lx, 6, lz, '#3f8f3f', { pivotTop: true }));
+      parts.body = this.box(g, 8, 12, 4, 0, 12, 0, '#4aa64a', skinOpts('creeper', [16, 16, 8, 12, 4]));
+      parts.head = this.box(g, 8, 8, 8, 0, 22, 0, '#4aa64a', skinOpts('creeper', [0, 0, 8, 8, 8], { face: face('#4aa64a') }));
+      for (const [lx, lz] of [[-2, -2], [2, -2], [-2, 2], [2, 2]]) parts.legs.push(this.box(g, 4, 6, 4, lx, 6, lz, '#3f8f3f', skinOpts('creeper', [0, 16, 4, 6, 4], { pivotTop: true })));
     } else {
       const skin = t === 'zombie' ? '#3f7a3f' : '#c8c8c8', shirt = t === 'zombie' ? '#2c6a8c' : '#c8c8c8', pants = t === 'zombie' ? '#3a2f8a' : '#c8c8c8';
       const lw = t === 'skeleton' ? 2 : 4;
-      parts.body = this.box(g, 8, 12, lw, 0, 18, 0, shirt);
-      parts.head = this.box(g, 8, 8, 8, 0, 28, 0, skin, { face: face(skin) });
-      for (const lx of [-2, 2]) parts.legs.push(this.box(g, lw, 12, lw, lx, 24, 0, pants, { pivotTop: true }));
-      for (const lx of [-6, 6]) parts.arms.push(this.box(g, lw, 12, lw, lx, 22, 0, skin, { pivotTop: true }));
+      parts.body = this.box(g, 8, 12, 4, 0, 18, 0, shirt, skinOpts(t, [16, 16, 8, 12, 4]));
+      parts.head = this.box(g, 8, 8, 8, 0, 28, 0, skin, skinOpts(t, [0, 0, 8, 8, 8], { face: face(skin) }));
+      for (const [i, lx] of [-2, 2].entries()) parts.legs.push(this.box(g, lw, 12, lw, lx, 12, 0, pants, skinOpts(t, [0, 16, lw, 12, lw], { pivotTop: true, mirror: i === 1 })));
+      for (const [i, lx] of [-6, 6].entries()) parts.arms.push(this.box(g, lw, 12, lw, lx, 24, 0, skin, skinOpts(t, [40, 16, lw, 12, lw], { pivotTop: true, mirror: i === 1 })));
       if (t === 'zombie') for (const a of parts.arms) a.rotation.x = -Math.PI / 2;
-      if (t === 'skeleton') { const bow = this.box(parts.arms[1], 1, 10, 2, 0, -8, -4, '#8a6a3a'); bow.rotation.x = 0.4; parts.arms[1].rotation.x = -Math.PI / 2 + 0.3; }
+      if (t === 'skeleton') { const bow = this.box(parts.arms[0], 1, 10, 2, 0, -8, -4, '#8a6a3a'); bow.rotation.x = 0.4; parts.arms[0].rotation.x = -Math.PI / 2 + 0.3; }
     }
     // Health bar sprite
     const cv = document.createElement('canvas'); cv.width = 32; cv.height = 4;
@@ -3755,6 +3879,7 @@ const Mobs = {
     hp.scale.set(0.8, 0.1, 1); hp.position.y = m.h + 0.35; hp.visible = false; g.add(hp);
     parts.hp = hp; parts.hpCanvas = cv;
     g.traverse(o => { if (o.isMesh) { o.userData.baseColors = (Array.isArray(o.material) ? o.material : [o.material]).map(mt => mt.color.clone()); } });
+    g.position.set(m.x, m.y, m.z); g.rotation.y = m.yaw;
     m.mesh = g; m.parts = parts;
   },
   updateHealthBar(m) {
@@ -3888,7 +4013,15 @@ const Mobs = {
     }
   },
   lineOfSight(m) { const ox = m.x, oy = m.y + m.h - 0.3, oz = m.z, dx = player.x - ox, dy = player.y + 1 - oy, dz = player.z - oz, l = Math.hypot(dx, dy, dz); return !Interaction.raycast(ox, oy, oz, dx / l, dy / l, dz / l, l); },
-  rebuild(m) { this.disposeModel(m); this.buildModel(m); this.scene.add(m.mesh); },
+  rebuild(m) {
+    const old = m.mesh, deathTilt = old ? old.rotation.z : 0, oldScale = old ? old.scale.clone() : null;
+    const showHealth = !!(m.parts && m.parts.hp && m.parts.hp.visible), hpTimer = m.hpTimer;
+    this.disposeModel(m); this.buildModel(m);
+    if (oldScale) m.mesh.scale.copy(oldScale);
+    m.mesh.rotation.z = deathTilt; this.scene.add(m.mesh);
+    if (showHealth) { this.updateHealthBar(m); m.hpTimer = hpTimer; }
+    m.lightTimer = 0;
+  },
 
   // ---- Per-frame movement + animation ----
   update(dt) {
@@ -3916,7 +4049,9 @@ const Mobs = {
       m.walkPhase += hs * dt * 4;
       const swing = Math.sin(m.walkPhase) * Math.min(1, hs) * 0.7;
       m.parts.legs.forEach((l, i) => { l.rotation.x = swing * (i % 2 ? -1 : 1) * (i >= 2 ? -1 : 1); });
-      if (m.type === 'skeleton') { /* arms hold the bow */ } else m.parts.arms.forEach((a, i) => { if (m.type !== 'zombie') a.rotation.x = swing * (i % 2 ? 1 : -1) * 0.8; });
+      if (m.type === 'chicken') m.parts.arms.forEach((a, i) => { a.rotation.z = swing * (i % 2 ? -1 : 1) * 0.8; });
+      else if (m.type === 'skeleton') { /* arms hold the bow */ }
+      else m.parts.arms.forEach((a, i) => { if (m.type !== 'zombie') a.rotation.x = swing * (i % 2 ? 1 : -1) * 0.8; });
       m.mesh.position.set(m.x, m.y, m.z);
       m.mesh.rotation.y = m.yaw;
       if (m.fuse >= 0) { const s = 1 + (30 - m.fuse) / 30 * 0.25; m.mesh.scale.set(s, s, s); }
@@ -4493,15 +4628,20 @@ const Save = {
 const Menus = {
   init() {
     const packStatus = (txt) => { $('packstatus').textContent = txt; $('packstatus2').textContent = txt; };
-    const loadPack = async (file) => {
+    let packIntent = 0;
+    const loadPack = async (file, intent = ++packIntent) => {
       if (!file) return;
       packStatus('Loading ' + file.name + ' …');
-      try { const r = await ResourcePack.load(file); packStatus(`Loaded "${file.name}": ${r.count}/${r.total} textures matched, ${Atlas.tileRes}x resolution (missing ones use procedural art).`); HUD.message('Resource pack loaded: ' + file.name); }
-      catch (e) { console.error(e); packStatus('Failed to read pack: ' + e.message); }
+      try {
+        const r = await ResourcePack.load(file);
+        if (!r || intent !== packIntent) return;
+        packStatus(`Loaded "${file.name}": ${r.count}/${r.total} block/item textures and ${r.mobCount}/${r.mobTotal} mob types textured, ${Atlas.tileRes}x resolution (missing ones use procedural art).`); HUD.message('Resource pack loaded: ' + file.name);
+      }
+      catch (e) { if (intent === packIntent) { console.error(e); packStatus('Failed to read pack: ' + e.message); } }
     };
     $('pack-file').addEventListener('change', (e) => loadPack(e.target.files[0]));
     $('pack-file-2').addEventListener('change', (e) => loadPack(e.target.files[0]));
-    $('btn-unload-pack').addEventListener('click', () => { ResourcePack.unload(); packStatus('No pack loaded — using procedural textures.'); });
+    $('btn-unload-pack').addEventListener('click', () => { packIntent++; ResourcePack.unload(); packStatus('No pack loaded — using procedural textures.'); });
     const dz = $('dropzone');
     ['dragenter', 'dragover'].forEach(ev => dz.addEventListener(ev, (e) => { e.preventDefault(); dz.classList.add('over'); }));
     ['dragleave', 'drop'].forEach(ev => dz.addEventListener(ev, (e) => { e.preventDefault(); dz.classList.remove('over'); }));
@@ -4512,12 +4652,14 @@ const Menus = {
 
     // Auto-load a pack served next to index.html (needs http://, not file://): ?pack=name.zip or resourcepack.zip
     if (location.protocol.startsWith('http')) {
+      const intent = ++packIntent;
       const packUrl = new URLSearchParams(location.search).get('pack') || 'resourcepack.zip';
       packStatus('Checking for ' + packUrl + ' …');
       fetch(packUrl).then(r => r.ok ? r.blob() : null).then(blob => {
+        if (intent !== packIntent) return;
         if (!blob || blob.size < 1024) { packStatus('No pack loaded — using procedural textures. Drop a .zip here to load one.'); return; }
-        return loadPack(new File([blob], packUrl.split('/').pop()));
-      }).catch(() => packStatus('No pack loaded — using procedural textures.'));
+        return loadPack(new File([blob], packUrl.split('/').pop()), intent);
+      }).catch(() => { if (intent === packIntent) packStatus('No pack loaded — using procedural textures.'); });
     }
     $('btn-play').addEventListener('click', () => {
       const seed = $('seed-input').value.trim() || String(Math.floor(Math.random() * 1e9));
@@ -4697,7 +4839,6 @@ window.addEventListener('beforeunload', () => { if (Game.running && Game.ready) 
    // STUB: Enchanting table, brewing stand, potions/effects.
    // STUB: Redstone repeaters, pistons, buttons, pressure plates, comparators (Redstone.updateConsumer).
    // STUB: Wall-torch tilt rendering (wall torches render as offset upright boxes).
-   // STUB: Resource-pack entity textures for mobs (Mobs.buildModel uses procedural colours).
    // STUB: Dyes / coloured wool crafting (only white wool is craftable; colours drop from sheep).
    // STUB: Throwable snowballs and eggs; chickens laying eggs.
    // STUB: Carrots/potatoes/melons/pumpkin stems as crops (items exist as food only).
