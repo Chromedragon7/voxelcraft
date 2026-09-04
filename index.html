@@ -3567,18 +3567,24 @@ const Entities = {
   itemGeometry(name, x, y, z) {
     const b = this.builder; b.reset();
     const it = Items.get(name), def = it && it.block !== null ? Blocks.byId[it.block] : null;
+    const isCube = !!(def && def.icon === 'cube');
     const sky = world.getSky(floor(x), floor(y), floor(z)), blk = world.getBlockLight(floor(x), floor(y), floor(z));
     const cl = [[sky, blk, 3], [sky, blk, 3], [sky, blk, 3], [sky, blk, 3]];
-    if (def && def.icon === 'cube') {
+    // Emit at unit size so every face gets the complete 0..1 texture UVs,
+    // then scale the finished geometry down to dropped-item size.
+    if (isCube) {
       const tiles = Blocks.tilesFor(def, 0), bio = BIOMES[world.getBiome(floor(x), floor(z))];
-      for (let f = 0; f < 6; f++) Mesher.emitFace(b, f, 0, 0, 0, 0.25, 0.25, 0.25, tiles[f], cl, Mesher.tintFor(def, f, bio), FACE_SHADE[f], null, false);
+      for (let f = 0; f < 6; f++) Mesher.emitFace(b, f, 0, 0, 0, 1, 1, 1, tiles[f], cl, Mesher.tintFor(def, f, bio), FACE_SHADE[f], null, false);
     } else {
       const tile = Atlas.index(def && !def.itemTex ? texFaces(def.tex)[0] : (it ? it.tex : 'missing'));
       const tint = def ? Mesher.tintFor(def, FACE_PZ, BIOMES[world.getBiome(floor(x), floor(z))]) : WHITE_RGB;
-      Mesher.emitFace(b, FACE_PZ, 0.3, 0, 0.49, 0.7, 0.4, 0.51, tile, cl, tint, 1, null, true);
+      Mesher.emitFace(b, FACE_PZ, 0, 0, 0, 1, 1, 0, tile, cl, tint, 1, null, true);
     }
     const geo = b.toGeometry();
-    if (geo) geo.translate(def && def.icon === 'cube' ? -0.125 : -0.5, 0, def && def.icon === 'cube' ? -0.125 : -0.5);
+    if (geo) {
+      if (isCube) { geo.scale(0.25, 0.25, 0.25); geo.translate(-0.125, 0, -0.125); }
+      else { geo.scale(0.4, 0.4, 0.4); geo.translate(-0.2, 0, 0); }
+    }
     return geo;
   },
   spawnItem(x, y, z, stack, vx = (rng.next() - 0.5) * 2, vy = 2.5, vz = (rng.next() - 0.5) * 2, pickupDelay = 10) {
