@@ -411,6 +411,7 @@ class GrowBuf {
 // Used by fluids, falling blocks, redstone torches, fire, spawners.
 const Scheduler = {
   tick: 0,
+  maxPerTick: 192,
   buckets: new Map(), // tick -> array of {x,y,z,type}
   pending: new Set(), // dedupe key posKey*8+type
   add(x, y, z, delay, type = 0) {
@@ -427,7 +428,16 @@ const Scheduler = {
     const b = this.buckets.get(this.tick);
     if (!b) return;
     this.buckets.delete(this.tick);
-    for (const e of b) { this.pending.delete(e.dk); handler(e.x, e.y, e.z, e.type); }
+    const count = Math.min(b.length, this.maxPerTick);
+    for (let i = 0; i < count; i++) { const e = b[i]; this.pending.delete(e.dk); handler(e.x, e.y, e.z, e.type); }
+    // Large fluid/fire/redstone bursts used to run atomically and freeze a frame.
+    // Keep overflow deduplicated and spread it over following simulation ticks.
+    if (count < b.length) {
+      const nextTick = this.tick + 1;
+      const overflow = b.slice(count), next = this.buckets.get(nextTick);
+      // Older deferred work stays ahead of newly scheduled next-tick work.
+      this.buckets.set(nextTick, next ? overflow.concat(next) : overflow);
+    }
   },
   clear() { this.buckets.clear(); this.pending.clear(); this.tick = 0; }
 };
@@ -1337,6 +1347,7 @@ class Chunk {
     this.biomes = new Uint8Array(CHUNK_W * CHUNK_W);
     this.state = CH_EMPTY;
     this.dirty = false;        // mesh out of date
+    this.dirtyAfter = 0;       // coalesce bursts before replacing GPU geometry
     this.modified = false;     // contains non-generated changes (persisted in saves)
     this.mesh = null; this.waterMesh = null; this.meshed = false;
     this.tiles = new Map();    // local block index -> tile entity (chest/furnace/spawner data)
@@ -1355,7 +1366,7 @@ class Chunk {
 class World {
   constructor() {
     this.chunks = new Map();          // key -> Chunk (loaded)
-    this.stored = new Map();          // key -> Chunk (unloaded but modified, kept for persistence)
+    this.stored = new Map();          // key -> compact serialized data for unloaded modified chunks
     this.pendingFeatures = new Map(); // key -> [[lx,y,lz,id,meta]...] features spilling into ungenerated chunks
     this.lastChunk = null;
     this.seed = 0;
@@ -1815,7 +1826,7 @@ const Lighting = {
   get(c, i, sky) { return sky ? c.sky[i] : c.blk[i]; },
   set(c, i, sky, v, x, y, z) {
     if (sky) c.sky[i] = v; else c.blk[i] = v;
-    c.dirty = true;
+    ChunkManager.flagDirty(c);
     // Border light changes affect the neighbour's smooth lighting
     const lx = x & 15, lz = z & 15;
     if (lx === 0 || lx === 15 || lz === 0 || lz === 15) ChunkManager.markDirty(x, y, z);
@@ -1858,7 +1869,7 @@ const Lighting = {
     this.seedFromNeighbors(c, false);
     this.propagate(false);
     c.state = CH_LIT;
-    c.dirty = true;
+    ChunkManager.flagDirty(c, 0);
   },
   // Enqueue lit blocks of neighbouring chunks that touch this chunk's border.
   seedFromNeighbors(c, sky) {
@@ -2336,22 +2347,69 @@ const Mesher = {
    ========================================================================== */
 const ChunkManager = {
   renderDistance: 6, scene: null, pcx: 1e9, pcz: 1e9, needsScan: true,
-  genQueue: [], stats: { generated: 0, meshed: 0, loaded: 0 }, firstLoad: true,
+  genQueue: [], genHead: 0, lightQueue: [], lightHead: 0, meshQueue: [], meshHead: 0,
+  meshWanted: new Set(), lightWanted: new Set(), keepWanted: new Set(),
+  compactQueue: [], compactHead: 0, compactHandle: null, compactKind: '',
+  workScanNeeded: true, nextDeferredScan: 0, workCursor: 0,
+  stats: { generated: 0, meshed: 0, loaded: 0 }, firstLoad: true,
   init(scene) { this.scene = scene; },
-  setRenderDistance(n) { this.renderDistance = clamp(n | 0, 2, 16); this.needsScan = true; },
+  resetWork() {
+    if (this.compactHandle !== null) {
+      if (this.compactKind === 'idle') cancelIdleCallback(this.compactHandle); else clearTimeout(this.compactHandle);
+    }
+    this.compactHandle = null; this.compactKind = ''; this.compactQueue.length = 0; this.compactHead = 0;
+    this.genQueue.length = this.lightQueue.length = this.meshQueue.length = 0;
+    this.genHead = this.lightHead = this.meshHead = 0;
+    this.meshWanted.clear(); this.lightWanted.clear(); this.keepWanted.clear();
+    this.needsScan = true; this.workScanNeeded = true; this.nextDeferredScan = 0; this.workCursor = 0;
+    this.pcx = this.pcz = 1e9; this.stats = { generated: 0, meshed: 0, loaded: 0 };
+  },
+  queueCompaction(c) {
+    world.stored.set(c.key, c);
+    this.compactQueue.push({ key: c.key, chunk: c });
+    this.scheduleCompaction();
+  },
+  runCompaction(deadline) {
+    this.compactHandle = null; this.compactKind = '';
+    let processed = 0;
+    while (this.compactHead < this.compactQueue.length && ((deadline.didTimeout && processed === 0) || (!deadline.didTimeout && deadline.timeRemaining() > 4))) {
+      const item = this.compactQueue[this.compactHead++]; processed++;
+      if (world.stored.get(item.key) === item.chunk) world.stored.set(item.key, world.serializeChunk(item.chunk));
+    }
+    if (this.compactHead >= this.compactQueue.length) { this.compactQueue.length = 0; this.compactHead = 0; }
+    else this.scheduleCompaction();
+  },
+  scheduleCompaction() {
+    if (this.compactHandle !== null || this.compactHead >= this.compactQueue.length) return;
+    if ('requestIdleCallback' in window) { this.compactKind = 'idle'; this.compactHandle = requestIdleCallback((deadline) => this.runCompaction(deadline), { timeout: 1500 }); }
+    else { this.compactKind = 'timer'; this.compactHandle = setTimeout(() => this.runCompaction({ didTimeout: true, timeRemaining: () => 0 }), 50); }
+  },
+  setRenderDistance(n) {
+    const next = clamp(n | 0, 2, 16);
+    if (next === this.renderDistance) return;
+    this.renderDistance = next; this.needsScan = true;
+  },
   disposeMesh(c) {
     if (c.mesh) { this.scene.remove(c.mesh); c.mesh.geometry.dispose(); c.mesh = null; }
     if (c.waterMesh) { this.scene.remove(c.waterMesh); c.waterMesh.geometry.dispose(); c.waterMesh = null; }
     c.meshed = false;
   },
+  // Coalesce lighting/simulation bursts so a chunk is rebuilt once after the
+  // burst, rather than repeatedly replacing the same GPU buffers.
+  flagDirty(c, delayMs = 48) {
+    if (!c || c.dirty) return;
+    c.dirtyAfter = c.meshed ? performance.now() + delayMs : 0;
+    c.dirty = true;
+    this.workScanNeeded = true;
+  },
   // Flag the chunk containing (x,y,z) — and neighbours if on a border — for remeshing.
   markDirty(x, y, z) {
     const cx = x >> 4, cz = z >> 4, lx = x & 15, lz = z & 15;
-    const c = world.getChunk(cx, cz); if (c) c.dirty = true;
+    const c = world.getChunk(cx, cz); this.flagDirty(c);
     const dxs = lx === 0 ? -1 : lx === 15 ? 1 : 0, dzs = lz === 0 ? -1 : lz === 15 ? 1 : 0;
-    if (dxs) { const n = world.getChunk(cx + dxs, cz); if (n) n.dirty = true; }
-    if (dzs) { const n = world.getChunk(cx, cz + dzs); if (n) n.dirty = true; }
-    if (dxs && dzs) { const n = world.getChunk(cx + dxs, cz + dzs); if (n) n.dirty = true; }
+    if (dxs) this.flagDirty(world.getChunk(cx + dxs, cz));
+    if (dzs) this.flagDirty(world.getChunk(cx, cz + dzs));
+    if (dxs && dzs) this.flagDirty(world.getChunk(cx + dxs, cz + dzs));
   },
   neighborsAtLeast(c, state) {
     for (let dx = -1; dx <= 1; dx++) for (let dz = -1; dz <= 1; dz++) {
@@ -2361,67 +2419,126 @@ const ChunkManager = {
     }
     return true;
   },
-  // Create/unload chunk records for the current player position
+  // Create a circular visible footprint plus two dependency rings (lighting
+  // and terrain). This avoids generating and drawing distant square corners.
+  buildFootprint() {
+    const rd = this.renderDistance, mesh = new Set(), light = new Set(), gen = new Map(), keep = new Set();
+    const add = (set, dx, dz) => set.add(chunkKey(this.pcx + dx, this.pcz + dz));
+    for (let dx = -rd; dx <= rd; dx++) for (let dz = -rd; dz <= rd; dz++) {
+      if (dx * dx + dz * dz > rd * rd) continue;
+      add(mesh, dx, dz);
+      for (let hx = -1; hx <= 1; hx++) for (let hz = -1; hz <= 1; hz++) add(light, dx + hx, dz + hz);
+      for (let hx = -2; hx <= 2; hx++) for (let hz = -2; hz <= 2; hz++) {
+        const cx = this.pcx + dx + hx, cz = this.pcz + dz + hz;
+        gen.set(chunkKey(cx, cz), [cx, cz]);
+      }
+      for (let hx = -3; hx <= 3; hx++) for (let hz = -3; hz <= 3; hz++) add(keep, dx + hx, dz + hz);
+    }
+    this.meshWanted = mesh; this.lightWanted = light; this.keepWanted = keep;
+    return gen;
+  },
+  // Create/unload chunk records for the current player position.
   scan() {
-    const rd = this.renderDistance, pcx = this.pcx, pcz = this.pcz;
-    const keep = rd + 3;
+    const pcx = this.pcx, pcz = this.pcz, genWanted = this.buildFootprint();
     for (const c of Array.from(world.chunks.values())) {
-      if (Math.abs(c.cx - pcx) > keep || Math.abs(c.cz - pcz) > keep) {
+      if (!this.keepWanted.has(c.key)) {
         this.disposeMesh(c);
         world.chunks.delete(c.key);
         if (world.lastChunk === c) world.lastChunk = null;
-        if (c.modified) world.stored.set(c.key, c);
+        if (c.modified) this.queueCompaction(c);
+      } else {
+        // Keep a small invisible geometry cache around the render disk. This
+        // avoids remeshing the same edge chunks when crossing a boundary.
+        const visible = this.meshWanted.has(c.key);
+        if (c.mesh) c.mesh.visible = visible;
+        if (c.waterMesh) c.waterMesh.visible = visible;
       }
     }
     this.genQueue.length = 0;
-    const R = rd + 2;
-    for (let dx = -R; dx <= R; dx++) for (let dz = -R; dz <= R; dz++) {
-      const cx = pcx + dx, cz = pcz + dz, k = chunkKey(cx, cz);
+    this.genHead = 0;
+    for (const [k, coord] of genWanted) {
+      const cx = coord[0], cz = coord[1];
       let c = world.chunks.get(k);
       if (!c) {
-        c = world.stored.get(k);
-        if (c) { world.stored.delete(k); c.meshed = false; c.dirty = true; if (c.state > CH_GENERATED) c.state = CH_GENERATED; world.chunks.set(k, c); world.applyPending(c); }
-        else c = new Chunk(cx, cz);
-        world.chunks.set(k, c);
+        const packed = world.stored.get(k);
+        if (packed) {
+          world.stored.delete(k);
+          c = packed instanceof Chunk ? packed : world.deserializeChunk(packed);
+          c.meshed = false; c.dirty = true; c.dirtyAfter = 0;
+          if (c.state > CH_GENERATED) c.state = CH_GENERATED;
+          world.chunks.set(k, c);
+          world.applyPending(c);
+        } else {
+          c = new Chunk(cx, cz);
+          world.chunks.set(k, c);
+        }
       }
       if (c.state === CH_EMPTY) this.genQueue.push(c);
     }
     this.genQueue.sort((a, b) => (dist2(a.cx, 0, a.cz, pcx, 0, pcz) - dist2(b.cx, 0, b.cz, pcx, 0, pcz)));
-    this.needsScan = false;
+    this.needsScan = false; this.workScanNeeded = true; this.nextDeferredScan = 0;
+  },
+  refreshWorkQueues() {
+    const pcx = this.pcx, pcz = this.pcz, now = performance.now();
+    this.lightQueue.length = 0; this.meshQueue.length = 0; this.lightHead = this.meshHead = 0;
+    let deferred = Infinity;
+    for (const c of world.chunks.values()) {
+      if (c.state >= CH_GENERATED && c.state < CH_LIT && this.lightWanted.has(c.key)) this.lightQueue.push(c);
+      else if (c.state === CH_LIT && this.meshWanted.has(c.key) && (c.dirty || !c.meshed)) {
+        if (c.meshed && c.dirtyAfter > now) deferred = Math.min(deferred, c.dirtyAfter);
+        else this.meshQueue.push(c);
+      }
+    }
+    const byDist = (a, b) => dist2(a.cx, 0, a.cz, pcx, 0, pcz) - dist2(b.cx, 0, b.cz, pcx, 0, pcz);
+    this.lightQueue.sort(byDist); this.meshQueue.sort(byDist);
+    this.nextDeferredScan = Number.isFinite(deferred) ? deferred : 0;
+    this.workScanNeeded = false;
+  },
+  runGen() {
+    while (this.genHead < this.genQueue.length) {
+      const c = this.genQueue[this.genHead++];
+      if (world.chunks.get(c.key) !== c || c.state !== CH_EMPTY) continue;
+      Terrain.generateChunk(c); this.stats.generated++; this.workScanNeeded = true;
+      return true;
+    }
+    this.genQueue.length = 0; this.genHead = 0;
+    return false;
+  },
+  runLight() {
+    while (this.lightHead < this.lightQueue.length) {
+      const c = this.lightQueue[this.lightHead++];
+      if (world.chunks.get(c.key) !== c || c.state < CH_GENERATED || c.state >= CH_LIT || !this.lightWanted.has(c.key)) continue;
+      if (!this.neighborsAtLeast(c, CH_GENERATED)) continue;
+      Lighting.initChunk(c); this.workScanNeeded = true;
+      return true;
+    }
+    this.lightQueue.length = 0; this.lightHead = 0;
+    return false;
+  },
+  runMesh() {
+    while (this.meshHead < this.meshQueue.length) {
+      const c = this.meshQueue[this.meshHead++];
+      if (world.chunks.get(c.key) !== c || c.state !== CH_LIT || !this.meshWanted.has(c.key) || (!c.dirty && c.meshed)) continue;
+      if (!this.neighborsAtLeast(c, CH_LIT)) continue;
+      Mesher.buildChunk(c); this.stats.meshed++;
+      return true;
+    }
+    this.meshQueue.length = 0; this.meshHead = 0;
+    return false;
   },
   update(px, pz, budgetMs) {
     const pcx = floor(px) >> 4, pcz = floor(pz) >> 4;
     if (pcx !== this.pcx || pcz !== this.pcz || this.needsScan) { this.pcx = pcx; this.pcz = pcz; this.scan(); }
-    const t0 = performance.now();
-    const rd = this.renderDistance;
-    // 1. generation (nearest first)
-    while (this.genQueue.length && performance.now() - t0 < budgetMs) {
-      const c = this.genQueue.shift();
-      if (c.state !== CH_EMPTY || !world.chunks.has(c.key)) continue;
-      Terrain.generateChunk(c);
-      this.stats.generated++;
-    }
-    // 2. lighting + 3. meshing: collect candidates sorted by distance
-    if (performance.now() - t0 < budgetMs) {
-      const light = [], mesh = [];
-      for (const c of world.chunks.values()) {
-        const d = Math.max(Math.abs(c.cx - pcx), Math.abs(c.cz - pcz));
-        if (c.state >= CH_GENERATED && c.state < CH_LIT && d <= rd + 1) light.push(c);
-        else if (c.state === CH_LIT && d <= rd && (c.dirty || !c.meshed)) mesh.push(c);
-      }
-      const byDist = (a, b) => dist2(a.cx, 0, a.cz, pcx, 0, pcz) - dist2(b.cx, 0, b.cz, pcx, 0, pcz);
-      light.sort(byDist); mesh.sort(byDist);
-      for (const c of light) {
-        if (performance.now() - t0 >= budgetMs) break;
-        if (!this.neighborsAtLeast(c, CH_GENERATED)) continue;
-        Lighting.initChunk(c);
-      }
-      for (const c of mesh) {
-        if (performance.now() - t0 >= budgetMs) break;
-        if (!this.neighborsAtLeast(c, CH_LIT)) continue;
-        Mesher.buildChunk(c);
-        this.stats.meshed++;
-      }
+    if (this.nextDeferredScan && performance.now() >= this.nextDeferredScan) this.workScanNeeded = true;
+    if (this.workScanNeeded) this.refreshWorkQueues();
+    // Round-robin prevents a generation backlog from starving nearby lighting
+    // and meshes. Jobs remain atomic, but no stage monopolizes every frame.
+    const deadline = performance.now() + budgetMs;
+    let misses = 0;
+    while (performance.now() < deadline && misses < 3) {
+      const stage = this.workCursor; this.workCursor = (this.workCursor + 1) % 3;
+      const didWork = stage === 0 ? this.runMesh() : stage === 1 ? this.runLight() : this.runGen();
+      misses = didWork ? 0 : misses + 1;
     }
     this.stats.loaded = world.chunks.size;
   },
@@ -2433,9 +2550,9 @@ const ChunkManager = {
   },
   // Progress fraction for the loading screen
   progress() {
-    let total = 0, done = 0;
-    const rd = this.renderDistance;
-    for (const c of world.chunks.values()) { const d = Math.max(Math.abs(c.cx - this.pcx), Math.abs(c.cz - this.pcz)); if (d <= rd) { total++; if (c.meshed) done++; } }
+    let done = 0;
+    const total = this.meshWanted.size;
+    for (const k of this.meshWanted) { const c = world.chunks.get(k); if (c && c.meshed) done++; }
     return total ? done / total : 0;
   }
 };
@@ -2443,7 +2560,7 @@ const ChunkManager = {
    11. PHYSICS + INPUT + PLAYER CONTROLLER + SURVIVAL STATS
    ----------------------------------------------------------------------------
    Entities are AABBs {x,y,z (feet centre), w (half width), h}. Movement is
-   axis-separated sweeps against block collision boxes with 1-block step-up.
+   axis-separated sweeps against block collision boxes with per-entity step-up.
    ========================================================================== */
 const Physics = {
   GRAVITY: 32, TERMINAL: 78, JUMP_VEL: 8.4,
@@ -2557,7 +2674,7 @@ const Input = {
 
 /* ---- Player ------------------------------------------------------------- */
 const player = {
-  x: 0, y: 80, z: 0, vx: 0, vy: 0, vz: 0, w: 0.3, h: 1.8, eyeHeight: 1.62, stepHeight: 1.0,
+  x: 0, y: 80, z: 0, vx: 0, vy: 0, vz: 0, w: 0.3, h: 1.8, eyeHeight: 1.62, stepHeight: 0.6,
   yaw: 0, pitch: 0, onGround: false, hitX: false, hitZ: false,
   health: 20, maxHealth: 20, hunger: 20, saturation: 5, exhaustion: 0, air: 300, fire: 0,
   flying: false, sneaking: false, sprinting: false, inWater: false, headInWater: false, inLava: false, onLadder: false,
@@ -2629,7 +2746,8 @@ const Player = {
       if (jump && p.onGround) { p.vy = Physics.JUMP_VEL; p.onGround = false; p.exhaustion += p.sprinting ? 0.2 : 0.05; }
       p.vy = Math.max(p.vy - Physics.GRAVITY * dt, -Physics.TERMINAL);
     }
-    p.stepHeight = p.sneaking ? 0.6 : 1.0;
+    // Small ledges remain walkable, but a full block always requires a jump.
+    p.stepHeight = 0.6;
     const prevOnGround = p.onGround, prevY = p.y;
     Physics.move(p, p.vx * dt, p.vy * dt, p.vz * dt);
     if (p.hitX) p.vx = 0; if (p.hitZ) p.vz = 0;
@@ -3127,8 +3245,9 @@ const Furnace = {
 };
 // Each game tick, run every furnace in loaded chunks (setBlock above keeps the tile because the id swap re-sets it)
 Events.on('tick', () => {
-  for (const c of world.chunks.values()) {
-    if (!c.tiles.size || Math.abs(c.cx - ChunkManager.pcx) > 4 || Math.abs(c.cz - ChunkManager.pcz) > 4) continue;
+  for (let cx = ChunkManager.pcx - 4; cx <= ChunkManager.pcx + 4; cx++) for (let cz = ChunkManager.pcz - 4; cz <= ChunkManager.pcz + 4; cz++) {
+    const c = world.getChunk(cx, cz);
+    if (!c || !c.tiles.size) continue;
     for (const [i, t] of c.tiles) if (t.type === 'furnace') Furnace.tick(t, c.cx * 16 + (i >> 11), i & 127, c.cz * 16 + ((i >> 7) & 15));
   }
 });
@@ -3307,11 +3426,13 @@ const Screens = {
    14. ENTITIES — item drops, arrows, primed TNT, particles, explosions
    ========================================================================== */
 const Particles = {
-  MAX: 4000, n: 0, pos: null, vel: null, life: null, col: null, points: null,
+  MAX: 4000, n: 0, pos: null, vel: null, life: null, col: null, points: null, colorDirty: false,
   init(scene) {
     this.pos = new Float32Array(this.MAX * 3); this.vel = new Float32Array(this.MAX * 3); this.life = new Float32Array(this.MAX); this.col = new Float32Array(this.MAX * 3);
     const g = new THREE.BufferGeometry();
-    g.setAttribute('position', new THREE.BufferAttribute(this.pos, 3)); g.setAttribute('color', new THREE.BufferAttribute(this.col, 3));
+    const pa = new THREE.BufferAttribute(this.pos, 3).setUsage(THREE.DynamicDrawUsage);
+    const ca = new THREE.BufferAttribute(this.col, 3).setUsage(THREE.DynamicDrawUsage);
+    g.setAttribute('position', pa); g.setAttribute('color', ca);
     g.setDrawRange(0, 0);
     this.points = new THREE.Points(g, new THREE.PointsMaterial({ size: 0.14, vertexColors: true, sizeAttenuation: true }));
     this.points.frustumCulled = false; scene.add(this.points);
@@ -3321,6 +3442,7 @@ const Particles = {
     const i = this.n++;
     this.pos[i * 3] = x; this.pos[i * 3 + 1] = y; this.pos[i * 3 + 2] = z; this.vel[i * 3] = vx; this.vel[i * 3 + 1] = vy; this.vel[i * 3 + 2] = vz; this.life[i] = life;
     this.col[i * 3] = r; this.col[i * 3 + 1] = g; this.col[i * 3 + 2] = b;
+    this.colorDirty = true;
   },
   blockBreak(x, y, z, def, count) {
     const tiles = Blocks.tilesFor(def, 0), t = tiles[FACE_PZ] * 3, tint = Mesher.tintFor(def, FACE_PZ, BIOMES[world.getBiome(x, z)]);
@@ -3329,14 +3451,21 @@ const Particles = {
   },
   burst(x, y, z, count, rgb, speed = 2) { for (let i = 0; i < count; i++) { const k = 0.8 + rng.next() * 0.4; this.spawn(x + (rng.next() - 0.5) * 0.5, y + (rng.next() - 0.5) * 0.5, z + (rng.next() - 0.5) * 0.5, (rng.next() - 0.5) * speed * 2, rng.next() * speed, (rng.next() - 0.5) * speed * 2, 0.4 + rng.next() * 0.6, rgb[0] * k, rgb[1] * k, rgb[2] * k); } },
   splash(x, y, z, count) { for (let i = 0; i < count; i++) this.spawn(x + (rng.next() - 0.5), y, z + (rng.next() - 0.5), (rng.next() - 0.5) * 2, rng.next() * 4 + 1, (rng.next() - 0.5) * 2, 0.6, 0.4, 0.6, 1.0); },
+  clear() { this.n = 0; this.colorDirty = false; if (this.points) this.points.geometry.setDrawRange(0, 0); },
   update(dt) {
+    if (this.n === 0) {
+      if (this.points.geometry.drawRange.count !== 0) this.points.geometry.setDrawRange(0, 0);
+      this.colorDirty = false;
+      return;
+    }
     const p = this.pos, v = this.vel;
+    let colorsChanged = this.colorDirty;
     for (let i = 0; i < this.n;) {
       this.life[i] -= dt;
       if (this.life[i] <= 0) { // swap-remove
         const l = --this.n;
         for (let k = 0; k < 3; k++) { p[i * 3 + k] = p[l * 3 + k]; v[i * 3 + k] = v[l * 3 + k]; this.col[i * 3 + k] = this.col[l * 3 + k]; }
-        this.life[i] = this.life[l]; continue;
+        this.life[i] = this.life[l]; colorsChanged = true; continue;
       }
       v[i * 3 + 1] -= 18 * dt;
       const nx = p[i * 3] + v[i * 3] * dt, ny = p[i * 3 + 1] + v[i * 3 + 1] * dt, nz = p[i * 3 + 2] + v[i * 3 + 2] * dt;
@@ -3344,16 +3473,40 @@ const Particles = {
       else { p[i * 3] = nx; p[i * 3 + 1] = ny; p[i * 3 + 2] = nz; }
       i++;
     }
-    this.points.geometry.attributes.position.needsUpdate = true; this.points.geometry.attributes.color.needsUpdate = true;
-    this.points.geometry.setDrawRange(0, this.n);
+    const geo = this.points.geometry;
+    geo.setDrawRange(0, this.n);
+    if (this.n > 0) {
+      const pa = geo.attributes.position;
+      pa.updateRange.offset = 0; pa.updateRange.count = this.n * 3; pa.needsUpdate = true;
+      if (colorsChanged) {
+        const ca = geo.attributes.color;
+        ca.updateRange.offset = 0; ca.updateRange.count = this.n * 3; ca.needsUpdate = true;
+      }
+    }
+    this.colorDirty = false;
   }
 };
 
 const Entities = {
-  list: [], scene: null, builder: new MeshBuilder(),
+  list: [], scene: null, builder: new MeshBuilder(), needsCompact: false,
   init(scene) { this.scene = scene; },
-  clear() { for (const e of this.list) if (e.mesh) this.scene.remove(e.mesh); this.list.length = 0; },
-  remove(e) { if (e.mesh) { this.scene.remove(e.mesh); if (e.mesh.geometry) e.mesh.geometry.dispose(); } e.dead = true; },
+  disposeMesh(e) {
+    if (!e.mesh) return;
+    this.scene.remove(e.mesh);
+    if (e.mesh.geometry) e.mesh.geometry.dispose();
+    if (e.ownsMaterial && e.mesh.material) {
+      const mats = Array.isArray(e.mesh.material) ? e.mesh.material : [e.mesh.material];
+      for (const mat of new Set(mats)) mat.dispose();
+    }
+    e.mesh = null;
+  },
+  clear() { for (const e of this.list) this.disposeMesh(e); this.list.length = 0; this.needsCompact = false; },
+  remove(e) { if (!e || e.dead) return; this.disposeMesh(e); e.dead = true; this.needsCompact = true; },
+  compact() {
+    let write = 0;
+    for (let read = 0; read < this.list.length; read++) if (!this.list[read].dead) this.list[write++] = this.list[read];
+    this.list.length = write; this.needsCompact = false;
+  },
 
   // Geometry for a dropped item: block -> small cube, otherwise a flat sprite. Light is baked at build time.
   itemGeometry(name, x, y, z) {
@@ -3381,7 +3534,7 @@ const Entities = {
     return e;
   },
   spawnArrow(x, y, z, vx, vy, vz, owner, damage) {
-    const e = { kind: 'arrow', x, y, z, vx, vy, vz, owner, damage, age: 0, stuck: false, w: 0.05, h: 0.05 };
+    const e = { kind: 'arrow', x, y, z, vx, vy, vz, owner, damage, age: 0, stuck: false, w: 0.05, h: 0.05, ownsMaterial: true };
     e.mesh = new THREE.Mesh(new THREE.BoxGeometry(0.05, 0.05, 0.6), new THREE.MeshLambertMaterial({ color: 0x8a6a3a }));
     this.scene.add(e.mesh); this.list.push(e);
     return e;
@@ -3460,7 +3613,7 @@ const Entities = {
         for (let j = i + 1; j < this.list.length; j++) { const b = this.list[j]; if (b.dead || b.kind !== 'item' || !Inventory.canMerge(a.stack, b.stack)) continue;
           if (dist2(a.x, a.y, a.z, b.x, b.y, b.z) < 0.6 && a.stack.count + b.stack.count <= Inventory.maxStack(a.stack.name)) { a.stack.count += b.stack.count; this.remove(b); } } }
     }
-    this.list = this.list.filter(e => !e.dead);
+    if (this.needsCompact) this.compact();
   },
 
   // Explosion: destroys blocks in a jittered sphere, damages entities, chains TNT.
@@ -3510,9 +3663,28 @@ const MOB_TYPES = {
 const SHEEP_COLOR_WEIGHTS = [['white', 81], ['black', 5], ['gray', 5], ['light_gray', 5], ['brown', 3], ['pink', 1]];
 
 const Mobs = {
-  list: [], scene: null, faceTex: new Map(),
+  list: [], scene: null, faceTex: new Map(), needsCompact: false,
   init(scene) { this.scene = scene; },
-  clear() { for (const m of this.list) this.scene.remove(m.mesh); this.list.length = 0; },
+  disposeModel(m) {
+    if (!m || !m.mesh) return;
+    this.scene.remove(m.mesh);
+    const geometries = new Set(), materials = new Set();
+    m.mesh.traverse(o => {
+      if (o.geometry) geometries.add(o.geometry);
+      if (o.material) for (const mat of (Array.isArray(o.material) ? o.material : [o.material])) materials.add(mat);
+    });
+    for (const geo of geometries) geo.dispose();
+    for (const mat of materials) mat.dispose();
+    // Face maps are shared in faceTex; only the per-mob health texture is owned here.
+    if (m.parts && m.parts.hp && m.parts.hp.material.map) m.parts.hp.material.map.dispose();
+    m.mesh = null; m.parts = null;
+  },
+  clear() { for (const m of this.list) this.disposeModel(m); this.list.length = 0; this.needsCompact = false; },
+  compact() {
+    let write = 0;
+    for (let read = 0; read < this.list.length; read++) if (!this.list[read].removed) this.list[write++] = this.list[read];
+    this.list.length = write; this.needsCompact = false;
+  },
 
   // ---- Model construction ----
   faceTexture(type, base) {
@@ -3647,8 +3819,9 @@ const Mobs = {
       }
     }
     // Monster spawners
-    for (const c of world.chunks.values()) {
-      if (!c.tiles.size || Math.abs(c.cx - ChunkManager.pcx) > 2 || Math.abs(c.cz - ChunkManager.pcz) > 2) continue;
+    for (let cx = ChunkManager.pcx - 2; cx <= ChunkManager.pcx + 2; cx++) for (let cz = ChunkManager.pcz - 2; cz <= ChunkManager.pcz + 2; cz++) {
+      const c = world.getChunk(cx, cz);
+      if (!c || !c.tiles.size) continue;
       for (const [i, t] of c.tiles) if (t.type === 'spawner') {
         const x = c.cx * 16 + (i >> 11), y = i & 127, z = c.cz * 16 + ((i >> 7) & 15);
         if (dist2(x, y, z, p.x, p.y, p.z) > 256) continue;
@@ -3715,15 +3888,16 @@ const Mobs = {
     }
   },
   lineOfSight(m) { const ox = m.x, oy = m.y + m.h - 0.3, oz = m.z, dx = player.x - ox, dy = player.y + 1 - oy, dz = player.z - oz, l = Math.hypot(dx, dy, dz); return !Interaction.raycast(ox, oy, oz, dx / l, dy / l, dz / l, l); },
-  rebuild(m) { this.scene.remove(m.mesh); this.buildModel(m); this.scene.add(m.mesh); },
+  rebuild(m) { this.disposeModel(m); this.buildModel(m); this.scene.add(m.mesh); },
 
   // ---- Per-frame movement + animation ----
   update(dt) {
     for (const m of this.list) {
+      if (m.removed) continue;
       if (m.dead) {
         m.deathTimer += dt;
         m.mesh.rotation.z = Math.min(Math.PI / 2, m.deathTimer * 4);
-        if (m.deathTimer > 0.7) { this.scene.remove(m.mesh); m.removed = true; }
+        if (m.deathTimer > 0.7) { this.disposeModel(m); m.removed = true; this.needsCompact = true; }
         continue;
       }
       const d = m.def, speed = d.speed * (m.state === 'flee' ? 1.5 : 1) * (m.fuse >= 0 ? 0 : 1);
@@ -3757,7 +3931,7 @@ const Mobs = {
         m.mesh.traverse(o => { if (o.isMesh) { const mats = Array.isArray(o.material) ? o.material : [o.material]; mats.forEach((mt, i) => { const b = o.userData.baseColors[i]; mt.color.setRGB(Math.min(1, b.r * br + red * 0.6), b.g * br * (1 - red * 0.6), b.b * br * (1 - red * 0.6)); }); } });
       }
     }
-    if (this.list.some(m => m.removed)) this.list = this.list.filter(m => !m.removed);
+    if (this.needsCompact) this.compact();
   },
 
   hurt(m, amount, source, kb) {
@@ -3774,7 +3948,7 @@ const Mobs = {
     for (const [item, a, b] of m.def.drops) { const n = rng.irange(a, b); if (n > 0) Entities.spawnItem(m.x, m.y + 0.5, m.z, { name: item, count: n }); }
     if (m.type === 'sheep' && !m.sheared) Entities.spawnItem(m.x, m.y + 0.5, m.z, { name: m.color + '_wool', count: 1 });
   },
-  remove(m) { this.scene.remove(m.mesh); m.removed = true; m.dead = true; },
+  remove(m) { if (!m || m.removed) return; this.disposeModel(m); m.removed = true; m.dead = true; this.needsCompact = true; },
   shear(m) {
     if (m.sheared) return false;
     m.sheared = true; m.regrow = 1200 + rng.int(1200);
@@ -4133,16 +4307,18 @@ const Sky = {
 };
 
 const Weather = {
-  raining: false, amount: 0, timer: 6000, points: null, pos: null, N: 1400, snowMode: false,
+  raining: false, amount: 0, timer: 6000, points: null, pos: null, N: 1400, activeN: 0, snowMode: false,
   init(scene) {
     this.pos = new Float32Array(this.N * 3);
-    const g = new THREE.BufferGeometry(); g.setAttribute('position', new THREE.BufferAttribute(this.pos, 3));
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.BufferAttribute(this.pos, 3).setUsage(THREE.DynamicDrawUsage)); g.setDrawRange(0, 0);
     this.rainMat = new THREE.PointsMaterial({ color: 0x9db4ff, size: 0.08, transparent: true, opacity: 0.7, sizeAttenuation: true });
     this.snowMat = new THREE.PointsMaterial({ color: 0xffffff, size: 0.14, transparent: true, opacity: 0.9, sizeAttenuation: true });
     this.points = new THREE.Points(g, this.rainMat); this.points.visible = false; this.points.frustumCulled = false; scene.add(this.points);
     for (let i = 0; i < this.N; i++) this.reset(i, true);
   },
   reset(i, anywhere) { this.pos[i * 3] = player.x + (rng.next() - 0.5) * 28; this.pos[i * 3 + 1] = player.y + (anywhere ? rng.next() * 20 - 4 : 14 + rng.next() * 6); this.pos[i * 3 + 2] = player.z + (rng.next() - 0.5) * 28; },
+  clear() { this.amount = 0; this.activeN = 0; if (this.points) { this.points.visible = false; this.points.geometry.setDrawRange(0, 0); } },
   toggle() { this.raining = !this.raining; this.timer = 4000 + rng.int(8000); HUD.message(this.raining ? 'Rain starts' : 'Rain stops'); },
   tick() { if (--this.timer <= 0) { this.raining = !this.raining; this.timer = this.raining ? 2000 + rng.int(5000) : 8000 + rng.int(16000); } },
   update(dt) {
@@ -4150,12 +4326,13 @@ const Weather = {
     const canRain = bio !== BIO_DESERT;
     const target = this.raining && canRain ? 1 : 0;
     this.amount += (target - this.amount) * Math.min(1, dt * 0.5);
-    this.snowMode = bio === BIO_SNOWY || (bio === BIO_MOUNTAINS && player.y > 90) || bio === BIO_TAIGA && player.y > 80;
-    this.points.material = this.snowMode ? this.snowMat : this.rainMat;
+    const snow = bio === BIO_SNOWY || (bio === BIO_MOUNTAINS && player.y > 90) || bio === BIO_TAIGA && player.y > 80;
+    if (snow !== this.snowMode) { this.snowMode = snow; this.points.material = snow ? this.snowMat : this.rainMat; }
     this.points.visible = this.amount > 0.05;
-    if (!this.points.visible) return;
+    if (!this.points.visible) { this.activeN = 0; this.points.geometry.setDrawRange(0, 0); return; }
     const speed = this.snowMode ? 3 : 22, p = this.pos;
     const n = floor(this.N * this.amount);
+    if (n > this.activeN) for (let i = this.activeN; i < n; i++) this.reset(i, true);
     for (let i = 0; i < n; i++) {
       p[i * 3 + 1] -= speed * dt * (0.8 + (i % 5) * 0.1);
       if (this.snowMode) p[i * 3] += Math.sin(p[i * 3 + 1] + i) * dt * 0.5;
@@ -4165,8 +4342,10 @@ const Weather = {
         this.reset(i, false);
       }
     }
-    for (let i = n; i < this.N; i++) p[i * 3 + 1] = -100;
-    this.points.geometry.attributes.position.needsUpdate = true;
+    this.activeN = n;
+    const geo = this.points.geometry; geo.setDrawRange(0, n);
+    const pa = geo.attributes.position;
+    pa.updateRange.offset = 0; pa.updateRange.count = n * 3; pa.needsUpdate = true;
   }
 };
 /* ============================================================================
@@ -4240,11 +4419,27 @@ const HUD = {
 
 /* ---- Persistence ------------------------------------------------------------ */
 const Save = {
-  KEY: 'voxelcraft_save_v1',
+  KEY: 'voxelcraft_save_v1', saving: false, pending: false, idleHandle: null, idleKind: '',
+  schedule() {
+    this.pending = true;
+    if (this.saving || this.idleHandle !== null) return;
+    const run = () => {
+      this.idleHandle = null; this.idleKind = ''; this.pending = false;
+      if (Game.running && Game.ready) this.save(true);
+    };
+    if ('requestIdleCallback' in window) { this.idleKind = 'idle'; this.idleHandle = requestIdleCallback(run, { timeout: 4000 }); }
+    else { this.idleKind = 'timer'; this.idleHandle = setTimeout(run, 250); }
+  },
+  cancelScheduled() {
+    if (this.idleHandle !== null) {
+      if (this.idleKind === 'idle') cancelIdleCallback(this.idleHandle); else clearTimeout(this.idleHandle);
+    }
+    this.idleHandle = null; this.idleKind = ''; this.pending = false;
+  },
   serialize() {
     const chunks = [];
     for (const c of world.chunks.values()) if (c.modified) chunks.push(world.serializeChunk(c));
-    for (const c of world.stored.values()) chunks.push(world.serializeChunk(c));
+    for (const packed of world.stored.values()) chunks.push(packed instanceof Chunk ? world.serializeChunk(packed) : packed);
     const p = player;
     return { version: 1, seed: Game.seed, time: Sky.time, day: Sky.day, mode: Game.mode, raining: Weather.raining,
       player: { x: p.x, y: p.y, z: p.z, yaw: p.yaw, pitch: p.pitch, health: p.health, hunger: p.hunger, saturation: p.saturation, inventory: p.inventory, hotbar: p.hotbar, spawn: p.spawn, flying: p.flying },
@@ -4252,6 +4447,8 @@ const Save = {
   },
   // localStorage copy is deflated with JSZip (base64) so many chunks fit in the ~5 MB quota.
   async save(silent) {
+    if (this.saving) { this.pending = true; if (!silent) HUD.message('A save is already in progress'); return false; }
+    this.cancelScheduled(); this.saving = true;
     try {
       const data = this.serialize(), json = JSON.stringify(data);
       const zip = new JSZip(); zip.file('world.json', json);
@@ -4260,6 +4457,7 @@ const Save = {
       if (!silent) HUD.message(`World saved (${(b64.length / 1024).toFixed(0)} KB compressed, ${data.chunks.length} modified chunks)`);
       return true;
     } catch (e) { HUD.message('Save failed: ' + (e.name === 'QuotaExceededError' ? 'localStorage full — use Export JSON' : e.message)); return false; }
+    finally { this.saving = false; if (this.pending) { this.pending = false; this.schedule(); } }
   },
   // Synchronous fallback used on page unload (deflate is async); loadData accepts both formats.
   saveSync() { try { localStorage.setItem(this.KEY, JSON.stringify(this.serialize())); } catch (e) { /* quota: keep the previous compressed save */ } },
@@ -4348,7 +4546,7 @@ const Menus = {
    ========================================================================== */
 const Game = {
   running: false, paused: false, ready: false, mode: 'survival', seed: '', scene: null, camera: null, renderer: null, canvas: null,
-  last: 0, tickAccum: 0, autosave: 0, fov: 70,
+  last: 0, lastRender: 0, tickAccum: 0, autosave: 0, fov: 70,
   init() {
     this.canvas = $('gl');
     this.renderer = new THREE.WebGLRenderer({ canvas: this.canvas, antialias: false, powerPreference: 'high-performance' });
@@ -4356,7 +4554,8 @@ const Game = {
     this.scene = new THREE.Scene();
     this.camera = new THREE.PerspectiveCamera(70, 1, 0.05, 600);
     this.camera.rotation.order = 'YXZ';
-    this.resize(); window.addEventListener('resize', () => this.resize());
+    this.resize(); window.addEventListener('resize', () => { this.resize(); this.lastRender = 0; });
+    document.addEventListener('visibilitychange', () => { this.last = performance.now(); this.lastRender = 0; });
     // Texture atlas: register every texture name, draw it, resolve block tiles
     for (const n of Blocks.textureNames) Atlas.register(n);
     Atlas.build();
@@ -4373,11 +4572,13 @@ const Game = {
   // Start a new (or loaded) world with the given seed
   start(seed, data) {
     this.seed = String(seed);
-    world.reset(this.seed); Terrain.init(this.seed); Scheduler.clear(); Entities.clear(); Mobs.clear(); Particles.n = 0;
-    ChunkManager.needsScan = true; ChunkManager.pcx = 1e9; ChunkManager.stats = { generated: 0, meshed: 0, loaded: 0 };
-    Sky.time = 1000; Sky.day = 0; Weather.raining = false; Weather.amount = 0;
+    Save.cancelScheduled();
+    world.reset(this.seed); Terrain.init(this.seed); Scheduler.clear(); Entities.clear(); Mobs.clear(); Particles.clear();
+    ChunkManager.resetWork();
+    Sky.time = 1000; Sky.day = 0; Weather.raining = false; Weather.clear();
     if (data) {
-      for (const cd of data.chunks || []) { const c = world.deserializeChunk(cd); world.stored.set(c.key, c); }
+      // Keep distant saved chunks compact; hydrate them only when streaming reaches them.
+      for (const packed of data.chunks || []) world.stored.set(chunkKey(packed.cx, packed.cz), packed);
       Sky.time = data.time || 1000; Sky.day = data.day || 0; Weather.raining = !!data.raining; this.mode = data.mode || 'survival';
       const pl = data.player;
       Player.reset(pl.spawn || [pl.x, pl.y, pl.z]);
@@ -4393,13 +4594,14 @@ const Game = {
     HUD.refreshHotbar();
     $('start').classList.add('hidden'); $('death').classList.add('hidden'); $('pause').classList.add('hidden');
     $('loading').classList.remove('hidden'); $('loadtext').textContent = 'Generating world…';
-    this.running = true; this.paused = false; this.ready = false; this.autosave = 0;
+    this.running = true; this.paused = false; this.ready = false; this.autosave = 0; this.tickAccum = 0;
+    this.last = performance.now(); this.lastRender = 0;
     HUD.message('Seed: ' + this.seed + ' · Press E for inventory, Esc for menu');
   },
   stop() {
-    this.running = false; this.ready = false; Input.unlock(); Screens.close();
+    this.running = false; this.ready = false; Save.cancelScheduled(); Input.unlock(); Screens.close();
     $('pause').classList.add('hidden'); $('start').classList.remove('hidden'); $('btn-continue').disabled = !Save.hasSave();
-    world.reset(this.seed); Entities.clear(); Mobs.clear();
+    world.reset(this.seed); ChunkManager.resetWork(); Entities.clear(); Mobs.clear(); Particles.clear(); Weather.clear();
   },
   // New worlds: the noise height ignores caves/ravines, so pick a nearby column whose real
   // surface matches the sampled height and stand the player on it.
@@ -4417,7 +4619,7 @@ const Game = {
     player.spawn = best.slice(); this.freshSpawn = false;
   },
   pause() { if (!this.running) return; this.paused = true; $('pause').classList.remove('hidden'); Input.unlock(); },
-  resume() { this.paused = false; $('pause').classList.add('hidden'); if (!player.dead) Input.lock(); },
+  resume() { this.paused = false; this.last = performance.now(); this.lastRender = 0; $('pause').classList.add('hidden'); if (!player.dead) Input.lock(); },
   toggleMode() {
     this.mode = this.mode === 'creative' ? 'survival' : 'creative';
     if (this.mode === 'survival') player.flying = false;
@@ -4434,8 +4636,13 @@ const Game = {
   },
   loop(now) {
     requestAnimationFrame((t) => this.loop(t));
+    // Menus and pause screens do not need a full-refresh-rate 3D redraw. World
+    // loading remains unthrottled so generation never slows down.
+    const idle = !this.running || (this.ready && this.paused);
+    if (idle && now - this.lastRender < 1000 / 12) return;
+    this.lastRender = now;
     this.frameMs = now - this.last;
-    const dt = Math.min(0.05, (now - this.last) / 1000); this.last = now;
+    const dt = Math.min(idle ? 0.1 : 0.05, (now - this.last) / 1000); this.last = now;
     if (this.running) {
       if (!this.ready) {
         ChunkManager.update(player.x, player.z, 40);
@@ -4456,7 +4663,7 @@ const Game = {
         Particles.update(dt);
         Weather.update(dt);
         this.autosave += dt;
-        if (this.autosave > 60) { this.autosave = 0; Save.save(true); }
+        if (this.autosave > 60) { this.autosave = 0; Save.schedule(); }
       }
       // Camera
       const p = player;
