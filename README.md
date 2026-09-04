@@ -8,7 +8,7 @@ Built with [Three.js](https://threejs.org/) (r128) and [JSZip](https://stuk.gith
 
 ## Run it
 
-- **From this workspace:** double-click the top-level `Play AI Minecraft Clones.cmd` launcher and open the Voxelcraft card. The launcher serves the game over HTTP, so the installed `resourcepack.zip` loads automatically.
+- **From this workspace:** double-click the top-level `Play AI Minecraft Clones.cmd` launcher and open the Voxelcraft card. The launcher serves the game over HTTP, so the included `resourcepack.zip` loads automatically.
 - **Simplest:** double-click `index.html`. Chrome, Edge and Firefox all work.
 - **With a resource pack that loads automatically:** serve the folder over HTTP and drop a pack next to the page as `resourcepack.zip`:
 
@@ -94,7 +94,7 @@ Unfinished or simplified features are marked in the code with `// STUB:`; the fu
 
 ## Third-party content
 
-- Resource packs are **not committed**. This workspace has a local, git-ignored `resourcepack.zip` copied from the supplied official Java 26.2 reference bundle. Mojang/Microsoft owns that art; keep it local unless your intended distribution complies with the applicable EULA and usage guidelines.
+- This repository includes `resourcepack.zip`, assembled only from the project owner's supplied `atlases`, `items`, `lang`, `models`, and `textures` folders. Its `assets/minecraft` folder names describe the compatible pack layout and do not establish who created the art. Verify the assets' provenance and redistribution rights before a public release.
 - Other packs, including [New Default+](https://modrinth.com/resourcepack/new-default-plus), carry their own licenses; download them yourself and place the ZIP next to `index.html` as `resourcepack.zip`.
 - Voxelcraft is an independent project. "Minecraft" is a trademark of Mojang Studios / Microsoft; this project is not affiliated with or endorsed by them.
 

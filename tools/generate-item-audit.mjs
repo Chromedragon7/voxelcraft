@@ -94,7 +94,7 @@ The complete absence list is [items-not-in-game.csv](items-not-in-game.csv). The
 
 ## Texture installation
 
-The supplied pack is installed locally as \`resourcepack.zip\` beside \`index.html\`. Voxelcraft loads it automatically when launched through the included local web launcher. The loader resolves the standard block and item PNGs and now also converts Java's special chest entity sheet into the three square chest faces used by Voxelcraft. The only atlas entry without a supplied texture is the intentional synthetic \`missing\` fallback tile.
+The supplied pack is included as \`resourcepack.zip\` beside \`index.html\`. Voxelcraft loads it automatically when served over HTTP, including through the workspace's local launcher or a static web host. The loader resolves the standard block and item PNGs and now also converts Java's special chest entity sheet into the three square chest faces used by Voxelcraft. The only atlas entry without a supplied texture is the intentional synthetic \`missing\` fallback tile.
 
 ## Items in the game
 
